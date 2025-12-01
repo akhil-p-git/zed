@@ -1,17 +1,31 @@
 use anyhow::Result;
+use collections::HashMap;
 use edit_prediction::{Direction, EditPrediction, EditPredictionProvider};
 use futures::AsyncReadExt;
 use gpui::{App, Context, Entity, EntityId, Global, Task};
 use http_client::{AsyncBody, HttpClient, Method, Request as HttpRequest};
 use language::{Anchor, Buffer, BufferSnapshot, Point};
 use serde::{Deserialize, Serialize};
-use std::{ops::Range, sync::Arc, time::Duration};
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    ops::Range,
+    sync::Arc,
+    time::Duration,
+};
 use text::{ToOffset, ToPoint};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub const DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(75);
 const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 const DEFAULT_MODEL: &str = "qwen2.5-coder:7b";
+
+/// Maximum bytes for prefix context (code before cursor)
+const MAX_PREFIX_BYTES: usize = 4096;
+/// Maximum bytes for suffix context (code after cursor)
+const MAX_SUFFIX_BYTES: usize = 1024;
+/// Maximum number of cached completions
+const MAX_CACHE_SIZE: usize = 50;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum OllamaConnectionStatus {
@@ -67,6 +81,24 @@ struct GenerateResponse {
     done: bool,
 }
 
+/// Response from Ollama's /api/tags endpoint
+#[derive(Deserialize)]
+struct TagsResponse {
+    models: Vec<ModelInfo>,
+}
+
+#[derive(Deserialize)]
+struct ModelInfo {
+    name: String,
+}
+
+/// Cached completion entry
+#[derive(Clone)]
+struct CachedCompletion {
+    prompt_hash: u64,
+    completion: String,
+}
+
 pub struct OllamaCompletionProvider {
     http_client: Arc<dyn HttpClient>,
     api_url: String,
@@ -75,6 +107,12 @@ pub struct OllamaCompletionProvider {
     completion_text: Option<String>,
     pending_refresh: Option<Task<Result<()>>>,
     completion_position: Option<Anchor>,
+    /// LRU-style cache: maps prompt hash to completion text
+    completion_cache: HashMap<u64, String>,
+    /// Order of cache entries for LRU eviction
+    cache_order: Vec<u64>,
+    /// Whether initial health check has been performed
+    health_checked: bool,
 }
 
 impl OllamaCompletionProvider {
@@ -87,6 +125,9 @@ impl OllamaCompletionProvider {
             completion_text: None,
             pending_refresh: None,
             completion_position: None,
+            completion_cache: HashMap::default(),
+            cache_order: Vec::new(),
+            health_checked: false,
         }
     }
 
@@ -100,6 +141,7 @@ impl OllamaCompletionProvider {
         self
     }
 
+    /// Build FIM prompt with optimized context window
     fn build_fim_prompt(
         &self,
         snapshot: &BufferSnapshot,
@@ -107,13 +149,141 @@ impl OllamaCompletionProvider {
     ) -> String {
         let cursor_offset = cursor_position.to_offset(snapshot);
 
-        let prefix = snapshot.text_for_range(0..cursor_offset).collect::<String>();
-        let suffix = snapshot.text_for_range(cursor_offset..snapshot.len()).collect::<String>();
+        // Get full prefix and suffix
+        let full_prefix: String = snapshot.text_for_range(0..cursor_offset).collect();
+        let full_suffix: String = snapshot.text_for_range(cursor_offset..snapshot.len()).collect();
+
+        // Optimize prefix: take last MAX_PREFIX_BYTES, but try to start at a line boundary
+        let prefix = if full_prefix.len() > MAX_PREFIX_BYTES {
+            let start = full_prefix.len() - MAX_PREFIX_BYTES;
+            // Find next newline after start to get a clean line boundary
+            if let Some(newline_offset) = full_prefix[start..].find('\n') {
+                &full_prefix[start + newline_offset + 1..]
+            } else {
+                &full_prefix[start..]
+            }
+        } else {
+            &full_prefix
+        };
+
+        // Optimize suffix: take first MAX_SUFFIX_BYTES, but try to end at a line boundary
+        let suffix = if full_suffix.len() > MAX_SUFFIX_BYTES {
+            // Find last newline before limit to get a clean line boundary
+            if let Some(newline_offset) = full_suffix[..MAX_SUFFIX_BYTES].rfind('\n') {
+                &full_suffix[..newline_offset + 1]
+            } else {
+                &full_suffix[..MAX_SUFFIX_BYTES]
+            }
+        } else {
+            &full_suffix
+        };
 
         format!(
             "<|fim_prefix|>{}<|fim_suffix|>{}<|fim_middle|>",
             prefix, suffix
         )
+    }
+
+    /// Compute hash of a prompt for caching
+    fn hash_prompt(prompt: &str) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        prompt.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Get cached completion if available
+    fn get_cached(&self, prompt_hash: u64) -> Option<&String> {
+        self.completion_cache.get(&prompt_hash)
+    }
+
+    /// Store completion in cache with LRU eviction
+    fn cache_completion(&mut self, prompt_hash: u64, completion: String) {
+        // Remove if already exists (will re-add at end for LRU)
+        if self.completion_cache.contains_key(&prompt_hash) {
+            self.cache_order.retain(|&h| h != prompt_hash);
+        }
+
+        // Evict oldest if at capacity
+        while self.completion_cache.len() >= MAX_CACHE_SIZE {
+            if let Some(oldest_hash) = self.cache_order.first().copied() {
+                self.completion_cache.remove(&oldest_hash);
+                self.cache_order.remove(0);
+            } else {
+                break;
+            }
+        }
+
+        self.completion_cache.insert(prompt_hash, completion);
+        self.cache_order.push(prompt_hash);
+    }
+
+    /// Check if Ollama server is running and model is available
+    pub async fn check_health(
+        http_client: Arc<dyn HttpClient>,
+        api_url: &str,
+        model: &str,
+    ) -> Result<(), String> {
+        let uri = format!("{}/api/tags", api_url);
+
+        let request = match HttpRequest::builder()
+            .method(Method::GET)
+            .uri(&uri)
+            .body(AsyncBody::default())
+        {
+            Ok(req) => req,
+            Err(e) => return Err(format!("Failed to build request: {}", e)),
+        };
+
+        let mut response = match http_client.send(request).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                let error_msg = e.to_string();
+                if error_msg.contains("Connection refused") {
+                    return Err("Ollama server is not running. Start with 'ollama serve'.".to_string());
+                }
+                return Err(format!("Cannot connect to Ollama: {}", error_msg));
+            }
+        };
+
+        if !response.status().is_success() {
+            return Err(format!("Ollama API error: {}", response.status()));
+        }
+
+        let mut body = String::new();
+        if let Err(e) = response.body_mut().read_to_string(&mut body).await {
+            return Err(format!("Failed to read response: {}", e));
+        }
+
+        let tags: TagsResponse = match serde_json::from_str(&body) {
+            Ok(t) => t,
+            Err(e) => return Err(format!("Invalid response from Ollama: {}", e)),
+        };
+
+        // Check if the configured model is available
+        // Model names can be "model:tag" or just "model"
+        let model_base = model.split(':').next().unwrap_or(model);
+        let model_available = tags.models.iter().any(|m| {
+            let available_base = m.name.split(':').next().unwrap_or(&m.name);
+            available_base == model_base || m.name == model
+        });
+
+        if !model_available {
+            let available: Vec<_> = tags.models.iter().map(|m| m.name.as_str()).collect();
+            if available.is_empty() {
+                return Err(format!(
+                    "No models installed. Run 'ollama pull {}'",
+                    model
+                ));
+            }
+            return Err(format!(
+                "Model '{}' not found. Available: {}. Run 'ollama pull {}'",
+                model,
+                available.join(", "),
+                model
+            ));
+        }
+
+        Ok(())
     }
 
     async fn fetch_completion(
@@ -294,15 +464,45 @@ impl EditPredictionProvider for OllamaCompletionProvider {
 
         let snapshot = buffer_handle.read(cx).snapshot();
         let prompt = self.build_fim_prompt(&snapshot, cursor_position);
+        let prompt_hash = Self::hash_prompt(&prompt);
+
+        // Check cache first
+        if let Some(cached) = self.get_cached(prompt_hash) {
+            self.completion_text = Some(cached.clone());
+            self.completion_position = Some(cursor_position);
+            self.buffer_id = Some(buffer_handle.entity_id());
+            cx.notify();
+            return;
+        }
 
         let http_client = self.http_client.clone();
         let api_url = self.api_url.clone();
         let model = self.model.clone();
         let buffer_id = buffer_handle.entity_id();
+        let should_health_check = !self.health_checked;
+        self.health_checked = true;
 
         self.pending_refresh = Some(cx.spawn(async move |this, cx| {
             if debounce {
                 cx.background_executor().timer(DEBOUNCE_TIMEOUT).await;
+            }
+
+            // Perform health check on first request
+            if should_health_check {
+                if let Err(error) = Self::check_health(
+                    http_client.clone(),
+                    &api_url,
+                    &model,
+                ).await {
+                    log::warn!("Ollama health check failed: {}", error);
+                    cx.update(|cx| {
+                        set_ollama_connection_status(
+                            OllamaConnectionStatus::Error(error),
+                            cx,
+                        );
+                    })?;
+                    return Ok(());
+                }
             }
 
             let completion = Self::fetch_completion(
@@ -314,7 +514,10 @@ impl EditPredictionProvider for OllamaCompletionProvider {
 
             match completion {
                 Ok(text) => {
+                    let text_clone = text.clone();
                     this.update(cx, |this, cx| {
+                        // Cache the completion
+                        this.cache_completion(prompt_hash, text_clone);
                         this.completion_text = Some(text);
                         this.completion_position = Some(cursor_position);
                         this.buffer_id = Some(buffer_id);
@@ -492,5 +695,89 @@ mod tests {
         let json = r#"{"response": "completed code", "done": true}"#;
         let response: GenerateResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.response, "completed code");
+    }
+
+    #[test]
+    fn test_prompt_hashing() {
+        let hash1 = OllamaCompletionProvider::hash_prompt("hello world");
+        let hash2 = OllamaCompletionProvider::hash_prompt("hello world");
+        let hash3 = OllamaCompletionProvider::hash_prompt("different prompt");
+
+        assert_eq!(hash1, hash2);
+        assert_ne!(hash1, hash3);
+    }
+
+    #[test]
+    fn test_completion_cache() {
+        use http_client::FakeHttpClient;
+
+        let http_client = FakeHttpClient::with_404_response();
+        let mut provider = OllamaCompletionProvider::new(http_client);
+
+        // Cache should be empty initially
+        assert!(provider.get_cached(12345).is_none());
+
+        // Add a completion
+        provider.cache_completion(12345, "completion1".to_string());
+        assert_eq!(provider.get_cached(12345), Some(&"completion1".to_string()));
+
+        // Add another
+        provider.cache_completion(67890, "completion2".to_string());
+        assert_eq!(provider.get_cached(67890), Some(&"completion2".to_string()));
+        assert_eq!(provider.get_cached(12345), Some(&"completion1".to_string()));
+    }
+
+    #[test]
+    fn test_cache_lru_eviction() {
+        use http_client::FakeHttpClient;
+
+        let http_client = FakeHttpClient::with_404_response();
+        let mut provider = OllamaCompletionProvider::new(http_client);
+
+        // Fill cache beyond capacity
+        for i in 0..(MAX_CACHE_SIZE + 10) {
+            provider.cache_completion(i as u64, format!("completion{}", i));
+        }
+
+        // Cache should be at max size
+        assert_eq!(provider.completion_cache.len(), MAX_CACHE_SIZE);
+
+        // First entries should be evicted
+        assert!(provider.get_cached(0).is_none());
+        assert!(provider.get_cached(9).is_none());
+
+        // Recent entries should still be present
+        let last_hash = (MAX_CACHE_SIZE + 9) as u64;
+        assert!(provider.get_cached(last_hash).is_some());
+    }
+
+    #[test]
+    fn test_tags_response_deserialization() {
+        let json = r#"{"models": [{"name": "qwen2.5-coder:7b"}, {"name": "codellama:7b"}]}"#;
+        let response: TagsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.models.len(), 2);
+        assert_eq!(response.models[0].name, "qwen2.5-coder:7b");
+        assert_eq!(response.models[1].name, "codellama:7b");
+    }
+
+    #[test]
+    fn test_tags_response_empty() {
+        let json = r#"{"models": []}"#;
+        let response: TagsResponse = serde_json::from_str(json).unwrap();
+        assert!(response.models.is_empty());
+    }
+
+    #[test]
+    fn test_provider_initial_state() {
+        use http_client::FakeHttpClient;
+
+        let http_client = FakeHttpClient::with_404_response();
+        let provider = OllamaCompletionProvider::new(http_client);
+
+        assert!(!provider.health_checked);
+        assert!(provider.completion_cache.is_empty());
+        assert!(provider.cache_order.is_empty());
+        assert!(provider.completion_text.is_none());
+        assert!(provider.buffer_id.is_none());
     }
 }

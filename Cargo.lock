@@ -10935,6 +10935,7 @@ name = "ollama_completion"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "collections",
  "edit_prediction",
  "futures 0.3.31",
  "gpui",
