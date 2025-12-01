@@ -205,7 +205,15 @@ fn assign_edit_prediction_provider(
         }
         EditPredictionProvider::Ollama => {
             let http_client = client.http_client();
-            let provider = cx.new(|_| OllamaCompletionProvider::new(http_client));
+            let settings = all_language_settings(None, cx).edit_predictions.ollama.clone();
+            let mut provider = OllamaCompletionProvider::new(http_client);
+            if let Some(url) = settings.api_url {
+                provider = provider.with_url(url);
+            }
+            if let Some(model) = settings.model {
+                provider = provider.with_model(model);
+            }
+            let provider = cx.new(|_| provider);
             editor.set_edit_prediction_provider(Some(provider), window, cx);
         }
         value @ (EditPredictionProvider::Experimental(_) | EditPredictionProvider::Zed) => {

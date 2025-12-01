@@ -158,6 +158,8 @@ pub struct EditPredictionSettingsContent {
     pub copilot: Option<CopilotSettingsContent>,
     /// Settings specific to Codestral.
     pub codestral: Option<CodestralSettingsContent>,
+    /// Settings specific to Ollama edit predictions.
+    pub ollama: Option<OllamaEditPredictionSettingsContent>,
     /// Whether edit predictions are enabled in the assistant prompt editor.
     /// This has no effect if globally disabled.
     pub enabled_in_text_threads: Option<bool>,
@@ -195,6 +197,20 @@ pub struct CodestralSettingsContent {
     /// Api URL to use for completions.
     ///
     /// Default: "https://codestral.mistral.ai"
+    #[serde(default)]
+    pub api_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
+pub struct OllamaEditPredictionSettingsContent {
+    /// Model to use for inline completions.
+    ///
+    /// Default: "qwen2.5-coder:7b"
+    #[serde(default)]
+    pub model: Option<String>,
+    /// API URL for the Ollama server.
+    ///
+    /// Default: "http://localhost:11434"
     #[serde(default)]
     pub api_url: Option<String>,
 }
