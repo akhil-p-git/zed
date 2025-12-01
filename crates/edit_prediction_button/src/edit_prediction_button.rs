@@ -465,6 +465,37 @@ impl Render for EditPredictionButton {
                 div().child(popover_menu.into_any_element())
             }
 
+            EditPredictionProvider::Ollama => {
+                let enabled = self.editor_enabled.unwrap_or(true);
+                let this = cx.weak_entity();
+
+                let icon = if enabled {
+                    IconName::ZedPredict
+                } else {
+                    IconName::ZedPredictDisabled
+                };
+
+                div().child(
+                    PopoverMenu::new("ollama")
+                        .menu(move |window, cx| {
+                            this.update(cx, |this, cx| this.build_ollama_context_menu(window, cx))
+                                .ok()
+                        })
+                        .anchor(Corner::BottomRight)
+                        .trigger_with_tooltip(
+                            IconButton::new("ollama-icon", icon)
+                                .shape(IconButtonShape::Square)
+                                .when(!enabled, |this| {
+                                    this.indicator(Indicator::dot().color(Color::Ignored))
+                                        .indicator_border_color(Some(
+                                            cx.theme().colors().status_bar_background,
+                                        ))
+                                }),
+                            move |_window, cx| Tooltip::for_action("Ollama", &ToggleMenu, cx),
+                        )
+                        .with_handle(self.popover_menu_handle.clone()),
+                )
+            }
             EditPredictionProvider::None => div().hidden(),
         }
     }
@@ -523,6 +554,8 @@ impl EditPredictionButton {
         if CodestralCompletionProvider::has_api_key(cx) {
             providers.push(EditPredictionProvider::Codestral);
         }
+
+        providers.push(EditPredictionProvider::Ollama);
 
         if cx.has_flag::<SweepFeatureFlag>() {
             providers.push(EditPredictionProvider::Experimental(
@@ -641,6 +674,13 @@ impl EditPredictionButton {
                         EXPERIMENTAL_ZETA2_EDIT_PREDICTION_PROVIDER_NAME,
                     ) => menu.item(
                         ContextMenuEntry::new("Zeta2")
+                            .toggleable(IconPosition::Start, is_current)
+                            .handler(move |_, cx| {
+                                set_completion_provider(fs.clone(), cx, provider);
+                            }),
+                    ),
+                    EditPredictionProvider::Ollama => menu.item(
+                        ContextMenuEntry::new("Ollama")
                             .toggleable(IconPosition::Start, is_current)
                             .handler(move |_, cx| {
                                 set_completion_provider(fs.clone(), cx, provider);
@@ -1013,6 +1053,17 @@ impl EditPredictionButton {
                 .entry("Configure Codestral API Key", None, move |window, cx| {
                     window.dispatch_action(zed_actions::agent::OpenSettings.boxed_clone(), cx);
                 })
+        })
+    }
+
+    fn build_ollama_context_menu(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ContextMenu> {
+        ContextMenu::build(window, cx, |menu, window, cx| {
+            let menu = self.build_language_settings_menu(menu, window, cx);
+            self.add_provider_switching_section(menu, EditPredictionProvider::Ollama, cx)
         })
     }
 
