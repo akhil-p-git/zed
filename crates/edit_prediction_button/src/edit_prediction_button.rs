@@ -18,6 +18,7 @@ use gpui::{
     ease_in_out, pulsating_between,
 };
 use indoc::indoc;
+use ollama_completion::{OllamaConnectionStatus, ollama_connection_status};
 use language::{
     EditPredictionsMode, File, Language,
     language_settings::{self, AllLanguageSettings, EditPredictionProvider, all_language_settings},
@@ -468,12 +469,29 @@ impl Render for EditPredictionButton {
             EditPredictionProvider::Ollama => {
                 let enabled = self.editor_enabled.unwrap_or(true);
                 let this = cx.weak_entity();
+                let connection_status = ollama_connection_status(cx);
+                let has_error = matches!(connection_status, OllamaConnectionStatus::Error(_));
 
                 let icon = if enabled {
                     IconName::ZedPredict
                 } else {
                     IconName::ZedPredictDisabled
                 };
+
+                let icon_button = IconButton::new("ollama-icon", icon)
+                    .shape(IconButtonShape::Square)
+                    .when(!enabled, |this| {
+                        this.indicator(Indicator::dot().color(Color::Ignored))
+                            .indicator_border_color(Some(
+                                cx.theme().colors().status_bar_background,
+                            ))
+                    })
+                    .when(has_error && enabled, |this| {
+                        this.indicator(Indicator::dot().color(Color::Error))
+                            .indicator_border_color(Some(
+                                cx.theme().colors().status_bar_background,
+                            ))
+                    });
 
                 div().child(
                     PopoverMenu::new("ollama")
@@ -483,14 +501,7 @@ impl Render for EditPredictionButton {
                         })
                         .anchor(Corner::BottomRight)
                         .trigger_with_tooltip(
-                            IconButton::new("ollama-icon", icon)
-                                .shape(IconButtonShape::Square)
-                                .when(!enabled, |this| {
-                                    this.indicator(Indicator::dot().color(Color::Ignored))
-                                        .indicator_border_color(Some(
-                                            cx.theme().colors().status_bar_background,
-                                        ))
-                                }),
+                            icon_button,
                             move |_window, cx| Tooltip::for_action("Ollama", &ToggleMenu, cx),
                         )
                         .with_handle(self.popover_menu_handle.clone()),
@@ -1061,7 +1072,47 @@ impl EditPredictionButton {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<ContextMenu> {
-        ContextMenu::build(window, cx, |menu, window, cx| {
+        ContextMenu::build(window, cx, |mut menu, window, cx| {
+            let connection_status = ollama_connection_status(cx);
+
+            match &connection_status {
+                OllamaConnectionStatus::Error(error) => {
+                    let error_display = if error.contains("Connection refused") {
+                        "Ollama server is not running. Start it with 'ollama serve'.".to_string()
+                    } else if error.contains("model") && error.contains("not found") {
+                        "Model not found. Pull it with 'ollama pull <model>'.".to_string()
+                    } else {
+                        format!("Error: {}", error.chars().take(60).collect::<String>())
+                    };
+
+                    menu = menu
+                        .custom_entry(
+                            move |_window, _cx| {
+                                Label::new(error_display.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Error)
+                                    .into_any_element()
+                            },
+                            |_window, _cx| {},
+                        )
+                        .separator();
+                }
+                OllamaConnectionStatus::Connected => {
+                    menu = menu
+                        .custom_entry(
+                            |_window, _cx| {
+                                Label::new("Connected to Ollama")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Success)
+                                    .into_any_element()
+                            },
+                            |_window, _cx| {},
+                        )
+                        .separator();
+                }
+                OllamaConnectionStatus::Unknown => {}
+            }
+
             let menu = self.build_language_settings_menu(menu, window, cx);
             self.add_provider_switching_section(menu, EditPredictionProvider::Ollama, cx)
         })

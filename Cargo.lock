@@ -5300,6 +5300,7 @@ dependencies = [
  "language",
  "lsp",
  "menu",
+ "ollama_completion",
  "paths",
  "project",
  "regex",

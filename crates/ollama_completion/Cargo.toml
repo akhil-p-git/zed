@@ -26,3 +26,6 @@ serde_json.workspace = true
 settings.workspace = true
 text.workspace = true
 unicode-segmentation.workspace = true
+
+[dev-dependencies]
+http_client = { workspace = true, features = ["test-support"] }

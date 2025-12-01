@@ -1,7 +1,7 @@
 use anyhow::Result;
 use edit_prediction::{Direction, EditPrediction, EditPredictionProvider};
 use futures::AsyncReadExt;
-use gpui::{App, Context, Entity, EntityId, Task};
+use gpui::{App, Context, Entity, EntityId, Global, Task};
 use http_client::{AsyncBody, HttpClient, Method, Request as HttpRequest};
 use language::{Anchor, Buffer, BufferSnapshot, Point};
 use serde::{Deserialize, Serialize};
@@ -12,6 +12,34 @@ use unicode_segmentation::UnicodeSegmentation;
 pub const DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(75);
 const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 const DEFAULT_MODEL: &str = "qwen2.5-coder:7b";
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum OllamaConnectionStatus {
+    Unknown,
+    Connected,
+    Error(String),
+}
+
+impl Default for OllamaConnectionStatus {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Default)]
+struct GlobalOllamaStatus(OllamaConnectionStatus);
+
+impl Global for GlobalOllamaStatus {}
+
+pub fn ollama_connection_status(cx: &App) -> OllamaConnectionStatus {
+    cx.try_global::<GlobalOllamaStatus>()
+        .map(|status| status.0.clone())
+        .unwrap_or_default()
+}
+
+fn set_ollama_connection_status(status: OllamaConnectionStatus, cx: &mut App) {
+    cx.set_global(GlobalOllamaStatus(status));
+}
 
 #[derive(Serialize)]
 struct GenerateRequest {
@@ -292,9 +320,19 @@ impl EditPredictionProvider for OllamaCompletionProvider {
                         this.buffer_id = Some(buffer_id);
                         cx.notify();
                     })?;
+                    cx.update(|cx| {
+                        set_ollama_connection_status(OllamaConnectionStatus::Connected, cx);
+                    })?;
                 }
                 Err(err) => {
-                    log::warn!("Ollama completion error: {}", err);
+                    let error_message = err.to_string();
+                    log::warn!("Ollama completion error: {}", error_message);
+                    cx.update(|cx| {
+                        set_ollama_connection_status(
+                            OllamaConnectionStatus::Error(error_message),
+                            cx,
+                        );
+                    })?;
                 }
             }
             Ok(())
@@ -347,5 +385,112 @@ impl EditPredictionProvider for OllamaCompletionProvider {
 
         let snapshot = buffer.read(cx).snapshot();
         Some(completion_from_text(snapshot, completion_text, cursor_position))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_has_leading_newline() {
+        assert!(has_leading_newline("\nfoo"));
+        assert!(has_leading_newline("  \nfoo"));
+        assert!(has_leading_newline("\t\nfoo"));
+        assert!(!has_leading_newline("foo\nbar"));
+        assert!(!has_leading_newline("foo"));
+        assert!(!has_leading_newline(""));
+    }
+
+    #[test]
+    fn test_trim_to_end_of_line_unless_leading_newline() {
+        assert_eq!(
+            trim_to_end_of_line_unless_leading_newline("foo\nbar"),
+            "foo"
+        );
+        assert_eq!(
+            trim_to_end_of_line_unless_leading_newline("foo bar"),
+            "foo bar"
+        );
+        assert_eq!(
+            trim_to_end_of_line_unless_leading_newline("\nfoo\nbar"),
+            "\nfoo\nbar"
+        );
+        assert_eq!(
+            trim_to_end_of_line_unless_leading_newline("  \nfoo"),
+            "  \nfoo"
+        );
+    }
+
+    #[test]
+    fn test_ollama_connection_status_default() {
+        let status = OllamaConnectionStatus::default();
+        assert_eq!(status, OllamaConnectionStatus::Unknown);
+    }
+
+    #[test]
+    fn test_ollama_connection_status_equality() {
+        assert_eq!(
+            OllamaConnectionStatus::Connected,
+            OllamaConnectionStatus::Connected
+        );
+        assert_eq!(
+            OllamaConnectionStatus::Error("test".to_string()),
+            OllamaConnectionStatus::Error("test".to_string())
+        );
+        assert_ne!(
+            OllamaConnectionStatus::Connected,
+            OllamaConnectionStatus::Unknown
+        );
+        assert_ne!(
+            OllamaConnectionStatus::Error("a".to_string()),
+            OllamaConnectionStatus::Error("b".to_string())
+        );
+    }
+
+    #[test]
+    fn test_provider_builder_methods() {
+        use http_client::FakeHttpClient;
+
+        let http_client = FakeHttpClient::with_404_response();
+        let provider = OllamaCompletionProvider::new(http_client.clone());
+
+        assert_eq!(provider.api_url, DEFAULT_OLLAMA_URL);
+        assert_eq!(provider.model, DEFAULT_MODEL);
+
+        let provider = provider
+            .with_url("http://custom:8080".to_string())
+            .with_model("custom-model".to_string());
+
+        assert_eq!(provider.api_url, "http://custom:8080");
+        assert_eq!(provider.model, "custom-model");
+    }
+
+    #[test]
+    fn test_generate_request_serialization() {
+        let request = GenerateRequest {
+            model: "test-model".to_string(),
+            prompt: "test prompt".to_string(),
+            stream: false,
+            options: Some(GenerateOptions {
+                num_predict: Some(256),
+                temperature: Some(0.2),
+                stop: Some(vec!["\n\n".to_string()]),
+            }),
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"model\":\"test-model\""));
+        assert!(json.contains("\"prompt\":\"test prompt\""));
+        assert!(json.contains("\"stream\":false"));
+        assert!(json.contains("\"num_predict\":256"));
+        assert!(json.contains("\"temperature\":0.2"));
+    }
+
+    #[test]
+    fn test_generate_response_deserialization() {
+        let json = r#"{"response": "completed code", "done": true}"#;
+        let response: GenerateResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.response, "completed code");
     }
 }
