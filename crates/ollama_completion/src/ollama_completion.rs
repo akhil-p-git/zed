@@ -1,7 +1,7 @@
 use anyhow::Result;
 use collections::HashMap;
 use edit_prediction::{Direction, EditPrediction, EditPredictionProvider};
-use futures::AsyncReadExt;
+use futures::{AsyncBufReadExt, AsyncReadExt, StreamExt, io::BufReader};
 use gpui::{App, Context, Entity, EntityId, Global, Task};
 use http_client::{AsyncBody, HttpClient, Method, Request as HttpRequest};
 use language::{Anchor, Buffer, BufferSnapshot, Point};
@@ -11,7 +11,7 @@ use std::{
     hash::{Hash, Hasher},
     ops::Range,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use text::{ToOffset, ToPoint};
 use unicode_segmentation::UnicodeSegmentation;
@@ -90,13 +90,6 @@ struct TagsResponse {
 #[derive(Deserialize)]
 struct ModelInfo {
     name: String,
-}
-
-/// Cached completion entry
-#[derive(Clone)]
-struct CachedCompletion {
-    prompt_hash: u64,
-    completion: String,
 }
 
 pub struct OllamaCompletionProvider {
@@ -286,18 +279,20 @@ impl OllamaCompletionProvider {
         Ok(())
     }
 
-    async fn fetch_completion(
+    /// Fetch completion using streaming for lower perceived latency
+    async fn fetch_completion_streaming(
         http_client: Arc<dyn HttpClient>,
         api_url: String,
         model: String,
         prompt: String,
-    ) -> Result<String> {
+    ) -> Result<(String, CompletionMetrics)> {
         let uri = format!("{}/api/generate", api_url);
+        let start_time = Instant::now();
 
         let request_body = GenerateRequest {
-            model,
+            model: model.clone(),
             prompt,
-            stream: false,
+            stream: true,
             options: Some(GenerateOptions {
                 num_predict: Some(256),
                 temperature: Some(0.2),
@@ -316,19 +311,73 @@ impl OllamaCompletionProvider {
             .header("Content-Type", "application/json")
             .body(AsyncBody::from(serde_json::to_string(&request_body)?))?;
 
-        let mut response = http_client.send(request).await?;
+        let response = http_client.send(request).await?;
 
-        if response.status().is_success() {
+        if !response.status().is_success() {
             let mut body = String::new();
-            response.body_mut().read_to_string(&mut body).await?;
-            let response: GenerateResponse = serde_json::from_str(&body)?;
-            Ok(response.response)
-        } else {
-            let mut body = String::new();
-            response.body_mut().read_to_string(&mut body).await?;
-            anyhow::bail!("Ollama API error: {} {}", response.status(), body)
+            response.into_body().read_to_string(&mut body).await?;
+            anyhow::bail!("Ollama API error: {}", body);
         }
+
+        // Stream the response line by line
+        let reader = BufReader::new(response.into_body());
+        let mut lines = reader.lines();
+        let mut completion = String::new();
+        let mut token_count = 0u32;
+        let mut first_token_time: Option<Duration> = None;
+
+        while let Some(line_result) = lines.next().await {
+            let line = line_result?;
+            if line.is_empty() {
+                continue;
+            }
+
+            if let Ok(chunk) = serde_json::from_str::<GenerateResponse>(&line) {
+                if first_token_time.is_none() && !chunk.response.is_empty() {
+                    first_token_time = Some(start_time.elapsed());
+                }
+                completion.push_str(&chunk.response);
+                token_count += 1;
+
+                if chunk.done {
+                    break;
+                }
+            }
+        }
+
+        let total_time = start_time.elapsed();
+        let metrics = CompletionMetrics {
+            model,
+            token_count,
+            total_time_ms: total_time.as_millis() as u64,
+            time_to_first_token_ms: first_token_time.map(|d| d.as_millis() as u64),
+            cached: false,
+        };
+
+        Ok((completion, metrics))
     }
+
+    /// Report telemetry event for completion
+    fn report_completion_event(metrics: &CompletionMetrics, success: bool) {
+        telemetry::event!(
+            "Ollama Completion",
+            model = metrics.model.clone(),
+            token_count = metrics.token_count,
+            total_time_ms = metrics.total_time_ms,
+            time_to_first_token_ms = metrics.time_to_first_token_ms.unwrap_or(0),
+            cached = metrics.cached,
+            success
+        );
+    }
+}
+
+/// Metrics collected during completion for telemetry
+struct CompletionMetrics {
+    model: String,
+    token_count: u32,
+    total_time_ms: u64,
+    time_to_first_token_ms: Option<u64>,
+    cached: bool,
 }
 
 fn completion_from_text(
@@ -468,6 +517,16 @@ impl EditPredictionProvider for OllamaCompletionProvider {
 
         // Check cache first
         if let Some(cached) = self.get_cached(prompt_hash) {
+            // Report cache hit telemetry
+            let metrics = CompletionMetrics {
+                model: self.model.clone(),
+                token_count: 0,
+                total_time_ms: 0,
+                time_to_first_token_ms: None,
+                cached: true,
+            };
+            Self::report_completion_event(&metrics, true);
+
             self.completion_text = Some(cached.clone());
             self.completion_position = Some(cursor_position);
             self.buffer_id = Some(buffer_handle.entity_id());
@@ -495,6 +554,10 @@ impl EditPredictionProvider for OllamaCompletionProvider {
                     &model,
                 ).await {
                     log::warn!("Ollama health check failed: {}", error);
+                    telemetry::event!(
+                        "Ollama Health Check Failed",
+                        error = error.clone()
+                    );
                     cx.update(|cx| {
                         set_ollama_connection_status(
                             OllamaConnectionStatus::Error(error),
@@ -503,9 +566,11 @@ impl EditPredictionProvider for OllamaCompletionProvider {
                     })?;
                     return Ok(());
                 }
+                telemetry::event!("Ollama Health Check Passed");
             }
 
-            let completion = Self::fetch_completion(
+            // Use streaming for lower latency
+            let completion = Self::fetch_completion_streaming(
                 http_client,
                 api_url,
                 model,
@@ -513,7 +578,8 @@ impl EditPredictionProvider for OllamaCompletionProvider {
             ).await;
 
             match completion {
-                Ok(text) => {
+                Ok((text, metrics)) => {
+                    Self::report_completion_event(&metrics, true);
                     let text_clone = text.clone();
                     this.update(cx, |this, cx| {
                         // Cache the completion
@@ -530,6 +596,10 @@ impl EditPredictionProvider for OllamaCompletionProvider {
                 Err(err) => {
                     let error_message = err.to_string();
                     log::warn!("Ollama completion error: {}", error_message);
+                    telemetry::event!(
+                        "Ollama Completion Failed",
+                        error = error_message.clone()
+                    );
                     cx.update(|cx| {
                         set_ollama_connection_status(
                             OllamaConnectionStatus::Error(error_message),
@@ -779,5 +849,69 @@ mod tests {
         assert!(provider.cache_order.is_empty());
         assert!(provider.completion_text.is_none());
         assert!(provider.buffer_id.is_none());
+    }
+
+    #[test]
+    fn test_streaming_response_deserialization() {
+        // Test partial streaming response
+        let partial = r#"{"response": "fn ", "done": false}"#;
+        let response: GenerateResponse = serde_json::from_str(partial).unwrap();
+        assert_eq!(response.response, "fn ");
+        assert!(!response.done);
+
+        // Test final streaming response
+        let final_response = r#"{"response": "", "done": true}"#;
+        let response: GenerateResponse = serde_json::from_str(final_response).unwrap();
+        assert_eq!(response.response, "");
+        assert!(response.done);
+    }
+
+    #[test]
+    fn test_streaming_request_serialization() {
+        let request = GenerateRequest {
+            model: "test-model".to_string(),
+            prompt: "test prompt".to_string(),
+            stream: true,
+            options: Some(GenerateOptions {
+                num_predict: Some(256),
+                temperature: Some(0.2),
+                stop: Some(vec!["\n\n".to_string()]),
+            }),
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"stream\":true"));
+    }
+
+    #[test]
+    fn test_completion_metrics() {
+        let metrics = CompletionMetrics {
+            model: "qwen2.5-coder:7b".to_string(),
+            token_count: 10,
+            total_time_ms: 500,
+            time_to_first_token_ms: Some(100),
+            cached: false,
+        };
+
+        assert_eq!(metrics.model, "qwen2.5-coder:7b");
+        assert_eq!(metrics.token_count, 10);
+        assert_eq!(metrics.total_time_ms, 500);
+        assert_eq!(metrics.time_to_first_token_ms, Some(100));
+        assert!(!metrics.cached);
+    }
+
+    #[test]
+    fn test_completion_metrics_cached() {
+        let metrics = CompletionMetrics {
+            model: "qwen2.5-coder:7b".to_string(),
+            token_count: 0,
+            total_time_ms: 0,
+            time_to_first_token_ms: None,
+            cached: true,
+        };
+
+        assert!(metrics.cached);
+        assert_eq!(metrics.token_count, 0);
+        assert_eq!(metrics.time_to_first_token_ms, None);
     }
 }

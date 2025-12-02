@@ -25,6 +25,7 @@ ollama.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
+telemetry.workspace = true
 text.workspace = true
 unicode-segmentation.workspace = true
 
