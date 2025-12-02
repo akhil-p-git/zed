@@ -213,6 +213,17 @@ pub struct OllamaEditPredictionSettingsContent {
     /// Default: "http://localhost:11434"
     #[serde(default)]
     pub api_url: Option<String>,
+    /// Temperature for sampling (0.0 to 2.0).
+    /// Lower values produce more focused/deterministic completions.
+    ///
+    /// Default: 0.2
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Maximum number of tokens to generate.
+    ///
+    /// Default: 256
+    #[serde(default)]
+    pub max_tokens: Option<i32>,
 }
 
 /// The mode in which edit predictions should be displayed.

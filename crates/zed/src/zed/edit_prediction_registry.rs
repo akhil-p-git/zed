@@ -213,6 +213,12 @@ fn assign_edit_prediction_provider(
             if let Some(model) = settings.model {
                 provider = provider.with_model(model);
             }
+            if let Some(temperature) = settings.temperature {
+                provider = provider.with_temperature(temperature);
+            }
+            if let Some(max_tokens) = settings.max_tokens {
+                provider = provider.with_max_tokens(max_tokens);
+            }
             let provider = cx.new(|_| provider);
             editor.set_edit_prediction_provider(Some(provider), window, cx);
         }

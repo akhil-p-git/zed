@@ -96,6 +96,8 @@ pub struct OllamaCompletionProvider {
     http_client: Arc<dyn HttpClient>,
     api_url: String,
     model: String,
+    temperature: f32,
+    max_tokens: i32,
     buffer_id: Option<EntityId>,
     completion_text: Option<String>,
     pending_refresh: Option<Task<Result<()>>>,
@@ -108,12 +110,17 @@ pub struct OllamaCompletionProvider {
     health_checked: bool,
 }
 
+const DEFAULT_TEMPERATURE: f32 = 0.2;
+const DEFAULT_MAX_TOKENS: i32 = 256;
+
 impl OllamaCompletionProvider {
     pub fn new(http_client: Arc<dyn HttpClient>) -> Self {
         Self {
             http_client,
             api_url: DEFAULT_OLLAMA_URL.to_string(),
             model: DEFAULT_MODEL.to_string(),
+            temperature: DEFAULT_TEMPERATURE,
+            max_tokens: DEFAULT_MAX_TOKENS,
             buffer_id: None,
             completion_text: None,
             pending_refresh: None,
@@ -131,6 +138,16 @@ impl OllamaCompletionProvider {
 
     pub fn with_model(mut self, model: String) -> Self {
         self.model = model;
+        self
+    }
+
+    pub fn with_temperature(mut self, temperature: f32) -> Self {
+        self.temperature = temperature;
+        self
+    }
+
+    pub fn with_max_tokens(mut self, max_tokens: i32) -> Self {
+        self.max_tokens = max_tokens;
         self
     }
 
@@ -285,6 +302,8 @@ impl OllamaCompletionProvider {
         api_url: String,
         model: String,
         prompt: String,
+        temperature: f32,
+        max_tokens: i32,
     ) -> Result<(String, CompletionMetrics)> {
         let uri = format!("{}/api/generate", api_url);
         let start_time = Instant::now();
@@ -294,8 +313,8 @@ impl OllamaCompletionProvider {
             prompt,
             stream: true,
             options: Some(GenerateOptions {
-                num_predict: Some(256),
-                temperature: Some(0.2),
+                num_predict: Some(max_tokens),
+                temperature: Some(temperature),
                 stop: Some(vec![
                     "\n\n".to_string(),
                     "<|fim_prefix|>".to_string(),
@@ -537,6 +556,8 @@ impl EditPredictionProvider for OllamaCompletionProvider {
         let http_client = self.http_client.clone();
         let api_url = self.api_url.clone();
         let model = self.model.clone();
+        let temperature = self.temperature;
+        let max_tokens = self.max_tokens;
         let buffer_id = buffer_handle.entity_id();
         let should_health_check = !self.health_checked;
         self.health_checked = true;
@@ -575,6 +596,8 @@ impl EditPredictionProvider for OllamaCompletionProvider {
                 api_url,
                 model,
                 prompt,
+                temperature,
+                max_tokens,
             ).await;
 
             match completion {
@@ -622,11 +645,33 @@ impl EditPredictionProvider for OllamaCompletionProvider {
     }
 
     fn accept(&mut self, _cx: &mut Context<Self>) {
+        if self.completion_text.is_some() {
+            telemetry::event!(
+                "Ollama Completion Accepted",
+                model = self.model.clone()
+            );
+        }
         reset_completion_cache(self);
     }
 
     fn discard(&mut self, _cx: &mut Context<Self>) {
+        if self.completion_text.is_some() {
+            telemetry::event!(
+                "Ollama Completion Discarded",
+                model = self.model.clone()
+            );
+        }
         reset_completion_cache(self);
+    }
+
+    fn did_show(&mut self, _cx: &mut Context<Self>) {
+        if let Some(completion) = &self.completion_text {
+            telemetry::event!(
+                "Ollama Completion Shown",
+                model = self.model.clone(),
+                completion_length = completion.len() as i64
+            );
+        }
     }
 
     fn suggest(
@@ -730,13 +775,19 @@ mod tests {
 
         assert_eq!(provider.api_url, DEFAULT_OLLAMA_URL);
         assert_eq!(provider.model, DEFAULT_MODEL);
+        assert_eq!(provider.temperature, DEFAULT_TEMPERATURE);
+        assert_eq!(provider.max_tokens, DEFAULT_MAX_TOKENS);
 
         let provider = provider
             .with_url("http://custom:8080".to_string())
-            .with_model("custom-model".to_string());
+            .with_model("custom-model".to_string())
+            .with_temperature(0.5)
+            .with_max_tokens(512);
 
         assert_eq!(provider.api_url, "http://custom:8080");
         assert_eq!(provider.model, "custom-model");
+        assert_eq!(provider.temperature, 0.5);
+        assert_eq!(provider.max_tokens, 512);
     }
 
     #[test]
@@ -849,6 +900,8 @@ mod tests {
         assert!(provider.cache_order.is_empty());
         assert!(provider.completion_text.is_none());
         assert!(provider.buffer_id.is_none());
+        assert_eq!(provider.temperature, DEFAULT_TEMPERATURE);
+        assert_eq!(provider.max_tokens, DEFAULT_MAX_TOKENS);
     }
 
     #[test]

@@ -429,6 +429,10 @@ pub struct OllamaSettings {
     pub model: Option<String>,
     /// Custom API URL for the Ollama server.
     pub api_url: Option<String>,
+    /// Temperature for sampling (0.0 to 2.0).
+    pub temperature: Option<f32>,
+    /// Maximum number of tokens to generate.
+    pub max_tokens: Option<i32>,
 }
 
 impl AllLanguageSettings {
@@ -653,6 +657,8 @@ impl settings::Settings for AllLanguageSettings {
         let ollama_settings = OllamaSettings {
             model: ollama.model,
             api_url: ollama.api_url,
+            temperature: ollama.temperature,
+            max_tokens: ollama.max_tokens,
         };
 
         let enabled_in_text_threads = edit_predictions.enabled_in_text_threads.unwrap();
