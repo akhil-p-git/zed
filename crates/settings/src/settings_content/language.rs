@@ -74,6 +74,7 @@ pub enum EditPredictionProvider {
     Supermaven,
     Zed,
     Codestral,
+    Ollama,
     Experimental(&'static str),
 }
 
@@ -93,6 +94,7 @@ impl<'de> Deserialize<'de> for EditPredictionProvider {
             Supermaven,
             Zed,
             Codestral,
+            Ollama,
             Experimental(String),
         }
 
@@ -102,6 +104,7 @@ impl<'de> Deserialize<'de> for EditPredictionProvider {
             Content::Supermaven => EditPredictionProvider::Supermaven,
             Content::Zed => EditPredictionProvider::Zed,
             Content::Codestral => EditPredictionProvider::Codestral,
+            Content::Ollama => EditPredictionProvider::Ollama,
             Content::Experimental(name)
                 if name == EXPERIMENTAL_SWEEP_EDIT_PREDICTION_PROVIDER_NAME =>
             {
@@ -134,6 +137,7 @@ impl EditPredictionProvider {
             | EditPredictionProvider::Copilot
             | EditPredictionProvider::Supermaven
             | EditPredictionProvider::Codestral
+            | EditPredictionProvider::Ollama
             | EditPredictionProvider::Experimental(_) => false,
         }
     }
@@ -154,6 +158,8 @@ pub struct EditPredictionSettingsContent {
     pub copilot: Option<CopilotSettingsContent>,
     /// Settings specific to Codestral.
     pub codestral: Option<CodestralSettingsContent>,
+    /// Settings specific to Ollama edit predictions.
+    pub ollama: Option<OllamaEditPredictionSettingsContent>,
     /// Whether edit predictions are enabled in the assistant prompt editor.
     /// This has no effect if globally disabled.
     pub enabled_in_text_threads: Option<bool>,
@@ -193,6 +199,31 @@ pub struct CodestralSettingsContent {
     /// Default: "https://codestral.mistral.ai"
     #[serde(default)]
     pub api_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
+pub struct OllamaEditPredictionSettingsContent {
+    /// Model to use for inline completions.
+    ///
+    /// Default: "qwen2.5-coder:7b"
+    #[serde(default)]
+    pub model: Option<String>,
+    /// API URL for the Ollama server.
+    ///
+    /// Default: "http://localhost:11434"
+    #[serde(default)]
+    pub api_url: Option<String>,
+    /// Temperature for sampling (0.0 to 2.0).
+    /// Lower values produce more focused/deterministic completions.
+    ///
+    /// Default: 0.2
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Maximum number of tokens to generate.
+    ///
+    /// Default: 256
+    #[serde(default)]
+    pub max_tokens: Option<i32>,
 }
 
 /// The mode in which edit predictions should be displayed.

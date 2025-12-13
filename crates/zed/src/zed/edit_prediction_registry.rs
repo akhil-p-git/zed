@@ -7,6 +7,7 @@ use feature_flags::FeatureFlagAppExt;
 use gpui::{AnyWindowHandle, App, AppContext as _, Context, Entity, WeakEntity};
 use language::language_settings::{EditPredictionProvider, all_language_settings};
 use language_models::MistralLanguageModelProvider;
+use ollama_completion::OllamaCompletionProvider;
 use settings::{
     EXPERIMENTAL_SWEEP_EDIT_PREDICTION_PROVIDER_NAME,
     EXPERIMENTAL_ZETA2_EDIT_PREDICTION_PROVIDER_NAME, SettingsStore,
@@ -200,6 +201,25 @@ fn assign_edit_prediction_provider(
         EditPredictionProvider::Codestral => {
             let http_client = client.http_client();
             let provider = cx.new(|_| CodestralCompletionProvider::new(http_client));
+            editor.set_edit_prediction_provider(Some(provider), window, cx);
+        }
+        EditPredictionProvider::Ollama => {
+            let http_client = client.http_client();
+            let settings = all_language_settings(None, cx).edit_predictions.ollama.clone();
+            let mut provider = OllamaCompletionProvider::new(http_client);
+            if let Some(url) = settings.api_url {
+                provider = provider.with_url(url);
+            }
+            if let Some(model) = settings.model {
+                provider = provider.with_model(model);
+            }
+            if let Some(temperature) = settings.temperature {
+                provider = provider.with_temperature(temperature);
+            }
+            if let Some(max_tokens) = settings.max_tokens {
+                provider = provider.with_max_tokens(max_tokens);
+            }
+            let provider = cx.new(|_| provider);
             editor.set_edit_prediction_provider(Some(provider), window, cx);
         }
         value @ (EditPredictionProvider::Experimental(_) | EditPredictionProvider::Zed) => {
